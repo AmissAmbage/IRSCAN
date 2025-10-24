@@ -58,6 +58,13 @@ bool overlayDirty = true;
 unsigned long lastOverlayDraw = 0;
 constexpr bool kShowDebugMessage = false;
 
+bool overlayEnabled = true;
+bool overlayCleared = false;
+
+uint32_t lastFrameDurationMicros = 0;
+uint32_t frameDurationAccumMicros = 0;
+uint16_t frameDurationSamples = 0;
+
 template <typename Sensor>
 bool setRefreshRateCompatImpl(Sensor &sensor, mlx90640_refreshrate rate, std::false_type) {
   return sensor.setRefreshRate(rate);
@@ -82,6 +89,21 @@ static void drawOverlay() {
   static int16_t lastRectY = -1;
   static uint16_t lastRectW = 0;
   static uint16_t lastRectH = 0;
+
+  if (!overlayEnabled) {
+    if (!overlayCleared) {
+      if (lastRectW > 0) {
+        display.fillRect(lastRectX, lastRectY, lastRectW, lastRectH, 0x0000);
+        lastRectW = 0;
+        lastRectH = 0;
+      }
+      display.fillScreen(0x0000);
+      overlayCleared = true;
+    }
+    return;
+  }
+
+  overlayCleared = false;
 
   char fpsBuffer[24];
   snprintf(fpsBuffer, sizeof(fpsBuffer), "FPS: %.2f", currentFPS);
@@ -144,7 +166,20 @@ static void updateFPS() {
       windowStart = now;
       return;
     }
-    currentFPS = (frameCount * 1000.0f) / static_cast<float>(elapsed);
+    float windowFPS = (frameCount * 1000.0f) / static_cast<float>(elapsed);
+    if (frameDurationSamples > 0) {
+      float avgMicros = static_cast<float>(frameDurationAccumMicros) /
+                        static_cast<float>(frameDurationSamples);
+      if (avgMicros > 1.0f) {
+        currentFPS = 1000000.0f / avgMicros;
+      } else {
+        currentFPS = windowFPS;
+      }
+    } else {
+      currentFPS = windowFPS;
+    }
+    frameDurationAccumMicros = 0;
+    frameDurationSamples = 0;
     frameCount = 0;
     windowStart = now;
     overlayDirty = true;
@@ -275,11 +310,15 @@ static bool acquireFrame(float *buffer) {
   constexpr uint8_t kMaxAttempts = 12;
   constexpr uint16_t kDataNotReadyDelayMs = 6;  // back off a little so conversions can complete
   const unsigned long startWait = millis();
+  const uint32_t startMicros = micros();
   bool sawDataNotReady = false;
 
   for (uint8_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
     int status = mlx.getFrame(buffer);
     if (status == 0) {
+      lastFrameDurationMicros = micros() - startMicros;
+      frameDurationAccumMicros += lastFrameDurationMicros;
+      ++frameDurationSamples;
       consecutiveI2CErrors = 0;
       consecutiveDataNotReadyFailures = 0;
       ++consecutiveGoodFrames;
@@ -344,7 +383,60 @@ static bool acquireFrame(float *buffer) {
   return false;
 }
 
+static void processSerialCommand(const String &line) {
+  if (line.equalsIgnoreCase("overlay off")) {
+    if (overlayEnabled) {
+      overlayEnabled = false;
+      overlayDirty = true;
+      Serial.println("overlay=OFF");
+    }
+  } else if (line.equalsIgnoreCase("overlay on")) {
+    if (!overlayEnabled) {
+      overlayEnabled = true;
+      overlayDirty = true;
+      Serial.println("overlay=ON");
+    }
+  } else if (line.equalsIgnoreCase("overlay")) {
+    overlayEnabled = !overlayEnabled;
+    overlayDirty = true;
+    Serial.print("overlay=");
+    Serial.println(overlayEnabled ? "ON" : "OFF");
+  } else if (line.equalsIgnoreCase("status")) {
+    Serial.print("fps=");
+    Serial.println(currentFPS, 3);
+    Serial.print("overlay=");
+    Serial.println(overlayEnabled ? "ON" : "OFF");
+    Serial.print("profile=");
+    Serial.println(kI2CProfiles[currentProfileIndex].label);
+    Serial.print("frame_us=");
+    Serial.println(lastFrameDurationMicros);
+  }
+}
+
+static void handleSerialCommands() {
+  static String buffer;
+
+  while (Serial.available()) {
+    char c = static_cast<char>(Serial.read());
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      buffer.trim();
+      if (buffer.length() > 0) {
+        processSerialCommand(buffer);
+      }
+      buffer = "";
+    } else {
+      if (buffer.length() < 64) {
+        buffer += c;
+      }
+    }
+  }
+}
+
 void loop() {
+  handleSerialCommands();
   bool frameReady = acquireFrame(frameBuffer);
   unsigned long now = millis();
 
