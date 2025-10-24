@@ -17,6 +17,9 @@ constexpr int TFT_BL   = 17;
 constexpr int I2C_SCL = 22;
 constexpr int I2C_SDA = 21;
 
+constexpr uint32_t MLX_I2C_FAST_HZ = 1000000;  // Fast-mode plus for full-speed streaming
+constexpr uint32_t MLX_I2C_SAFE_HZ = 400000;    // Reliable fallback when wiring is marginal
+
 constexpr uint16_t SCREEN_WIDTH  = 240;
 constexpr uint16_t SCREEN_HEIGHT = 240;
 constexpr uint16_t IMAGE_WIDTH   = 32;
@@ -32,10 +35,25 @@ bool haveValidFrame = false;
 
 unsigned long lastFrameMillis = 0;
 float currentFPS = 0.0f;
+uint32_t currentI2CClock = MLX_I2C_FAST_HZ;
+uint16_t goodFrameStreak = 0;
 
 uint8_t rowLUT[SCREEN_HEIGHT];
 uint8_t colLUT[SCREEN_WIDTH];
 uint16_t lineBuffer[SCREEN_WIDTH];
+
+static void applyI2CClock(uint32_t hz) {
+  Wire.setClock(hz);
+  currentI2CClock = hz;
+}
+
+static void ensureFastI2CIfStable() {
+  if (currentI2CClock == MLX_I2C_SAFE_HZ && goodFrameStreak >= 30) {
+    applyI2CClock(MLX_I2C_FAST_HZ);
+    Serial.println("I2C clock restored to 1MHz for MLX90640");
+    goodFrameStreak = 0;
+  }
+}
 
 // Simple blue-to-red color map for temperature visualization
 static uint16_t colorMap(float value, float minValue, float maxValue) {
@@ -138,11 +156,10 @@ void setup() {
   initializeLUTs();
 
   Wire.begin(I2C_SDA, I2C_SCL);
-  // The MLX90640 is specified for up to 1 MHz fast-mode plus, but many
-  // breakouts (and long wiring runs) struggle to remain reliable at that
-  // speed. 400 kHz has proven to be a safer setting in practice and avoids
-  // spurious I2C read errors that manifest as status -1 from getFrame().
-  Wire.setClock(400000);
+  // Start fast so we can drain full frames when the wiring and sensor allow it.
+  // acquireFrame() automatically backs off to 400 kHz if the bus reports an
+  // I2C fault, and attempts to restore 1 MHz after a run of stable frames.
+  applyI2CClock(MLX_I2C_FAST_HZ);
 
   if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
     debugMessage = "MLX init fail";
@@ -201,14 +218,18 @@ static String describeMlxError(int status) {
 }
 
 static bool acquireFrame(float *buffer) {
-  constexpr uint8_t kMaxAttempts = 12;
-  constexpr uint16_t kDataNotReadyDelayMs = 6;  // back off a little so conversions can complete
+  constexpr uint8_t kMaxAttempts = 40;
+  constexpr uint16_t kDataNotReadyDelayMs = 2;  // poll quickly but still give the sensor breathing room
   const unsigned long startWait = millis();
 
   for (uint8_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
     int status = mlx.getFrame(buffer);
     if (status == 0) {
       sensorHealthy = true;
+      if (goodFrameStreak < 60000) {
+        ++goodFrameStreak;
+      }
+      ensureFastI2CIfStable();
       if (!haveValidFrame || debugMessage == "Waiting" || debugMessage.startsWith("MLX ")) {
         debugMessage = "Streaming";
       }
@@ -222,6 +243,11 @@ static bool acquireFrame(float *buffer) {
     }
 
     sensorHealthy = false;
+    goodFrameStreak = 0;
+    if (status == -1 && currentI2CClock != MLX_I2C_SAFE_HZ) {
+      Serial.println("MLX90640 I2C fault, falling back to 400kHz");
+      applyI2CClock(MLX_I2C_SAFE_HZ);
+    }
     debugMessage = String("MLX ") + describeMlxError(status);
     Serial.print("MLX90640 read error: ");
     Serial.println(status);
@@ -234,6 +260,7 @@ static bool acquireFrame(float *buffer) {
       debugMessage = "Waiting";
     }
   }
+  goodFrameStreak = 0;
   return false;
 }
 
@@ -262,7 +289,7 @@ void loop() {
   }
 
   display.startWrite();
-  display.setAddrWindow(0, 0, SCREEN_WIDTH - 1, SCREEN_HEIGHT - 1);
+  display.setAddrWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
   for (uint16_t y = 0; y < SCREEN_HEIGHT; ++y) {
     uint16_t srcRow = rowLUT[y];
     const float *rowPtr = &frameBuffer[srcRow * IMAGE_WIDTH];
