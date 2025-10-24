@@ -204,36 +204,52 @@ static void applyI2CProfile(uint8_t index, bool announceChange = true) {
   }
 }
 
+static bool initializeSensor() {
+  for (uint8_t idx = 0; idx < kProfileCount; ++idx) {
+    const I2CProfile &profile = kI2CProfiles[idx];
+    Wire.setClock(profile.frequencyHz);
+
+    Serial.print("MLX init try ");
+    Serial.println(profile.label);
+
+    if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
+      Serial.println("  -> not found");
+      delay(30);
+      continue;
+    }
+
+    mlx.setMode(MLX90640_INTERLEAVED);
+    mlx.setResolution(MLX90640_ADC_18BIT);
+    applyI2CProfile(idx, false);
+
+    Serial.print("MLX init -> ");
+    Serial.println(kI2CProfiles[currentProfileIndex].label);
+    return true;
+  }
+
+  return false;
+}
+
 void setup() {
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
 
   Serial.begin(115200);
-  while (!Serial) {
-    delay(10);
-  }
 
   display.begin();
   display.fillScreen(0x0000);
   initializeColorLUT();
 
   Wire.begin(I2C_SDA, I2C_SCL);
-  // Start the bus at the fastest profile and dynamically scale down if the
-  // wiring cannot sustain 1 MHz transfers.
-  Wire.setClock(kI2CProfiles[currentProfileIndex].frequencyHz);
 
-  if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
+  if (!initializeSensor()) {
     debugMessage = "MLX init fail";
-    Serial.println("Failed to find MLX90640 sensor.");
+    Serial.println("Failed to find MLX90640 sensor at any profile.");
     while (true) {
       drawOverlay();
-      delay(100);
+      delay(120);
     }
   }
-
-  mlx.setMode(MLX90640_INTERLEAVED);
-  mlx.setResolution(MLX90640_ADC_18BIT);
-  applyI2CProfile(0);
 
   debugMessage = "Init OK";
   drawOverlay();
