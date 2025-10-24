@@ -135,12 +135,19 @@ static void drawCheckerWithStatus(const char *status) {
     }
   }
 
+  // Reserve a solid background so diagnostic text stands out clearly
+  const int overlayHeight = 64;
+  tft.fillRect(0, 0, 240, overlayHeight, TFT_BLACK);
+
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(6, 6);
-  tft.print("MLX90640 GC9A01A DIAG");
-  tft.setCursor(6, 24);
+  tft.setTextSize(2);
+  tft.setCursor(8, 10);
+  tft.print("MLX90640 DIAG");
+
+  tft.setTextSize(1);
+  tft.setCursor(8, 36);
   tft.print(status);
-  tft.setCursor(6, 44);
+  tft.setCursor(8, 50);
   tft.printf("fails=%lu  consec=%lu", (unsigned long)frameFails,
              (unsigned long)consecutiveFails);
 }
