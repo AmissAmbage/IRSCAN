@@ -58,6 +58,8 @@ float currentFPS = 0.0f;
 uint8_t rowLUT[SCREEN_HEIGHT];
 uint8_t colLUT[SCREEN_WIDTH];
 uint16_t lineBuffer[SCREEN_WIDTH];
+uint16_t sensorColorBuffer[IMAGE_WIDTH * IMAGE_HEIGHT];
+uint16_t colorLUT[256];
 
 template <typename Sensor>
 bool setRefreshRateCompatImpl(Sensor &sensor, mlx90640_refreshrate rate, std::false_type) {
@@ -77,39 +79,39 @@ bool setRefreshRateCompat(Sensor &sensor, mlx90640_refreshrate rate) {
 }
 
 // Simple blue-to-red color map for temperature visualization
-static uint16_t colorMap(float value, float minValue, float maxValue) {
-  value = constrain(value, minValue, maxValue);
-  float ratio = (maxValue - minValue) > 0 ? (value - minValue) / (maxValue - minValue) : 0.0f;
+static uint16_t colorMapFromIndex(uint8_t index) {
+  return colorLUT[index];
+}
 
-  // Use a simple gradient: blue -> cyan -> green -> yellow -> red
-  float r = 0, g = 0, b = 0;
-  if (ratio <= 0.25f) {
-    // Blue to Cyan
-    float local = ratio / 0.25f;
-    r = 0;
-    g = local * 255.0f;
-    b = 255.0f;
-  } else if (ratio <= 0.5f) {
-    // Cyan to Green
-    float local = (ratio - 0.25f) / 0.25f;
-    r = 0;
-    g = 255.0f;
-    b = (1.0f - local) * 255.0f;
-  } else if (ratio <= 0.75f) {
-    // Green to Yellow
-    float local = (ratio - 0.5f) / 0.25f;
-    r = local * 255.0f;
-    g = 255.0f;
-    b = 0;
-  } else {
-    // Yellow to Red
-    float local = (ratio - 0.75f) / 0.25f;
-    r = 255.0f;
-    g = (1.0f - local) * 255.0f;
-    b = 0;
+static void initializeColorLUT() {
+  for (int i = 0; i < 256; ++i) {
+    float ratio = i / 255.0f;
+
+    float r = 0, g = 0, b = 0;
+    if (ratio <= 0.25f) {
+      float local = ratio / 0.25f;
+      r = 0;
+      g = local * 255.0f;
+      b = 255.0f;
+    } else if (ratio <= 0.5f) {
+      float local = (ratio - 0.25f) / 0.25f;
+      r = 0;
+      g = 255.0f;
+      b = (1.0f - local) * 255.0f;
+    } else if (ratio <= 0.75f) {
+      float local = (ratio - 0.5f) / 0.25f;
+      r = local * 255.0f;
+      g = 255.0f;
+      b = 0;
+    } else {
+      float local = (ratio - 0.75f) / 0.25f;
+      r = 255.0f;
+      g = (1.0f - local) * 255.0f;
+      b = 0;
+    }
+
+    colorLUT[i] = display.color565(static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b));
   }
-
-  return display.color565(static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b));
 }
 
 static void drawOverlay() {
@@ -203,6 +205,7 @@ void setup() {
   display.begin();
   display.fillScreen(0x0000);
   initializeLUTs();
+  initializeColorLUT();
 
   Wire.begin(I2C_SDA, I2C_SCL);
   // Start the bus at the fastest profile and dynamically scale down if the
@@ -364,16 +367,29 @@ void loop() {
     }
   }
 
+  const float span = maxTemp - minTemp;
+  const float scale = span > 0.0001f ? (255.0f / span) : 0.0f;
+
+  for (size_t i = 0; i < IMAGE_WIDTH * IMAGE_HEIGHT; ++i) {
+    float value = frameBuffer[i];
+    float scaled = (value - minTemp) * scale;
+    int index = static_cast<int>(scaled + 0.5f);
+    if (index < 0) {
+      index = 0;
+    } else if (index > 255) {
+      index = 255;
+    }
+    sensorColorBuffer[i] = colorMapFromIndex(static_cast<uint8_t>(index));
+  }
+
   display.startWrite();
-  display.setAddrWindow(0, 0, SCREEN_WIDTH - 1, SCREEN_HEIGHT - 1);
+  display.setAddrWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
   for (uint16_t y = 0; y < SCREEN_HEIGHT; ++y) {
     uint16_t srcRow = rowLUT[y];
-    const float *rowPtr = &frameBuffer[srcRow * IMAGE_WIDTH];
     for (uint16_t x = 0; x < SCREEN_WIDTH; ++x) {
-      float value = rowPtr[colLUT[x]];
-      lineBuffer[x] = colorMap(value, minTemp, maxTemp);
+      lineBuffer[x] = sensorColorBuffer[srcRow * IMAGE_WIDTH + colLUT[x]];
     }
-    display.writePixels(lineBuffer, SCREEN_WIDTH, false);
+    display.writePixels(lineBuffer, SCREEN_WIDTH);
   }
   display.endWrite();
 
