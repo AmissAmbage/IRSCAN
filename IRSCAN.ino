@@ -4,6 +4,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
 #include <Adafruit_MLX90640.h>
+#include <type_traits>
+#include <utility>
 
 // Display pin definitions
 constexpr int TFT_MOSI = 23;
@@ -149,6 +151,23 @@ static void setStreamingMessage() {
   debugMessage = String("Stream ") + kI2CProfiles[currentProfileIndex].label;
 }
 
+template <typename Sensor>
+static bool setRefreshRateCompatImpl(Sensor &sensor, mlx90640_refreshrate rate, std::true_type) {
+  return sensor.setRefreshRate(rate);
+}
+
+template <typename Sensor>
+static bool setRefreshRateCompatImpl(Sensor &sensor, mlx90640_refreshrate rate, std::false_type) {
+  sensor.setRefreshRate(rate);
+  return true;
+}
+
+template <typename Sensor>
+static bool setRefreshRateCompat(Sensor &sensor, mlx90640_refreshrate rate) {
+  using ReturnT = decltype(sensor.setRefreshRate(std::declval<mlx90640_refreshrate>()));
+  return setRefreshRateCompatImpl(sensor, rate, std::is_same<ReturnT, bool>{});
+}
+
 static void applyI2CProfile(uint8_t index, bool announceChange = true) {
   if (index >= kProfileCount) {
     index = kProfileCount - 1;
@@ -157,7 +176,7 @@ static void applyI2CProfile(uint8_t index, bool announceChange = true) {
   const I2CProfile &profile = kI2CProfiles[currentProfileIndex];
 
   Wire.setClock(profile.frequencyHz);
-  if (!mlx.setRefreshRate(profile.refreshRate)) {
+  if (!setRefreshRateCompat(mlx, profile.refreshRate)) {
     Serial.println("Failed to update MLX refresh rate");
   }
   lastProfileChangeMillis = millis();
