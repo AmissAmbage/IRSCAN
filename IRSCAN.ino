@@ -4,7 +4,6 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
 #include <Adafruit_MLX90640.h>
-#include <algorithm>
 
 // Display pin definitions
 constexpr int TFT_MOSI = 23;
@@ -20,15 +19,21 @@ constexpr int I2C_SDA = 21;
 
 constexpr uint16_t SCREEN_WIDTH  = 240;
 constexpr uint16_t SCREEN_HEIGHT = 240;
+constexpr uint16_t IMAGE_WIDTH   = 32;
+constexpr uint16_t IMAGE_HEIGHT  = 24;
 
 Adafruit_GC9A01A display = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 Adafruit_MLX90640 mlx;
 
-float frameBuffer[32 * 24];
+float frameBuffer[IMAGE_WIDTH * IMAGE_HEIGHT];
 String debugMessage = "Boot";
 
 unsigned long lastFrameMillis = 0;
 float currentFPS = 0.0f;
+
+uint8_t rowLUT[SCREEN_HEIGHT];
+uint8_t colLUT[SCREEN_WIDTH];
+uint16_t lineBuffer[SCREEN_WIDTH];
 
 // Simple blue-to-red color map for temperature visualization
 static uint16_t colorMap(float value, float minValue, float maxValue) {
@@ -91,6 +96,21 @@ static void drawOverlay() {
   display.print(debugMessage);
 }
 
+static void initializeLUTs() {
+  for (uint16_t y = 0; y < SCREEN_HEIGHT; ++y) {
+    rowLUT[y] = (y * IMAGE_HEIGHT) / SCREEN_HEIGHT;
+    if (rowLUT[y] >= IMAGE_HEIGHT) {
+      rowLUT[y] = IMAGE_HEIGHT - 1;
+    }
+  }
+  for (uint16_t x = 0; x < SCREEN_WIDTH; ++x) {
+    colLUT[x] = (x * IMAGE_WIDTH) / SCREEN_WIDTH;
+    if (colLUT[x] >= IMAGE_WIDTH) {
+      colLUT[x] = IMAGE_WIDTH - 1;
+    }
+  }
+}
+
 static void updateFPS() {
   unsigned long now = millis();
   if (lastFrameMillis != 0) {
@@ -113,6 +133,7 @@ void setup() {
 
   display.begin();
   display.fillScreen(0x0000);
+  initializeLUTs();
 
   Wire.begin(I2C_SDA, I2C_SCL);
   // The MLX90640 is specified for up to 1 MHz fast-mode plus, but many
@@ -132,7 +153,7 @@ void setup() {
 
   mlx.setMode(MLX90640_INTERLEAVED);
   mlx.setResolution(MLX90640_ADC_18BIT);
-  mlx.setRefreshRate(MLX90640_16_HZ);
+  mlx.setRefreshRate(MLX90640_32_HZ);
 
   debugMessage = "Init OK";
   drawOverlay();
@@ -191,22 +212,16 @@ void loop() {
     }
   }
 
-  constexpr uint16_t imageWidth = 32;
-  constexpr uint16_t imageHeight = 24;
-
   display.startWrite();
-  for (uint16_t y = 0; y < imageHeight; ++y) {
-    uint16_t drawY0 = (y * SCREEN_HEIGHT) / imageHeight;
-    uint16_t drawY1 = ((y + 1) * SCREEN_HEIGHT) / imageHeight;
-    uint16_t rectHeight = std::max<uint16_t>(1, drawY1 - drawY0);
-    for (uint16_t x = 0; x < imageWidth; ++x) {
-      float value = frameBuffer[y * imageWidth + x];
-      uint16_t color = colorMap(value, minTemp, maxTemp);
-      uint16_t drawX0 = (x * SCREEN_WIDTH) / imageWidth;
-      uint16_t drawX1 = ((x + 1) * SCREEN_WIDTH) / imageWidth;
-      uint16_t rectWidth = std::max<uint16_t>(1, drawX1 - drawX0);
-      display.writeFillRectPreclipped(drawX0, drawY0, rectWidth, rectHeight, color);
+  for (uint16_t y = 0; y < SCREEN_HEIGHT; ++y) {
+    uint16_t srcRow = rowLUT[y];
+    const float *rowPtr = &frameBuffer[srcRow * IMAGE_WIDTH];
+    for (uint16_t x = 0; x < SCREEN_WIDTH; ++x) {
+      float value = rowPtr[colLUT[x]];
+      lineBuffer[x] = colorMap(value, minTemp, maxTemp);
     }
+    display.setAddrWindow(0, y, SCREEN_WIDTH - 1, y);
+    display.writePixels(lineBuffer, SCREEN_WIDTH, false);
   }
   display.endWrite();
 
