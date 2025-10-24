@@ -55,10 +55,13 @@ bool haveValidFrame = false;
 unsigned long lastFrameMillis = 0;
 float currentFPS = 0.0f;
 
-uint8_t rowLUT[SCREEN_HEIGHT];
-uint8_t colLUT[SCREEN_WIDTH];
-uint16_t lineBuffer[SCREEN_WIDTH];
-uint16_t sensorColorBuffer[IMAGE_WIDTH * IMAGE_HEIGHT];
+static const int DST_W = 224;
+static const int SCALE_X = 7;
+static const int SCALE_Y = 10;
+static const int X_OFFSET = (SCREEN_WIDTH - DST_W) / 2;
+
+uint16_t lineBuffer[DST_W];
+uint8_t indexBuffer[IMAGE_WIDTH * IMAGE_HEIGHT];
 uint16_t colorLUT[256];
 
 template <typename Sensor>
@@ -114,6 +117,29 @@ static void initializeColorLUT() {
   }
 }
 
+static inline void buildLineFromRow(const uint8_t *row) {
+  for (int x = 0; x < IMAGE_WIDTH; ++x) {
+    uint16_t color = colorMapFromIndex(row[x]);
+    int dst = x * SCALE_X;
+    lineBuffer[dst + 0] = color;
+    lineBuffer[dst + 1] = color;
+    lineBuffer[dst + 2] = color;
+    lineBuffer[dst + 3] = color;
+    lineBuffer[dst + 4] = color;
+    lineBuffer[dst + 5] = color;
+    lineBuffer[dst + 6] = color;
+  }
+}
+
+static inline void pushRowBlock(int sensorRow) {
+  display.startWrite();
+  display.setAddrWindow(X_OFFSET, sensorRow * SCALE_Y, DST_W, SCALE_Y);
+  for (int i = 0; i < SCALE_Y; ++i) {
+    display.writePixels(lineBuffer, DST_W, true);
+  }
+  display.endWrite();
+}
+
 static void drawOverlay() {
   char fpsBuffer[16];
   snprintf(fpsBuffer, sizeof(fpsBuffer), "FPS: %.1f", currentFPS);
@@ -137,21 +163,6 @@ static void drawOverlay() {
   display.fillRect(dbgX - 2, dbgY - 2, w + 4, h + 4, 0x0000);
   display.setCursor(dbgX, dbgY);
   display.print(debugMessage);
-}
-
-static void initializeLUTs() {
-  for (uint16_t y = 0; y < SCREEN_HEIGHT; ++y) {
-    rowLUT[y] = (y * IMAGE_HEIGHT) / SCREEN_HEIGHT;
-    if (rowLUT[y] >= IMAGE_HEIGHT) {
-      rowLUT[y] = IMAGE_HEIGHT - 1;
-    }
-  }
-  for (uint16_t x = 0; x < SCREEN_WIDTH; ++x) {
-    colLUT[x] = (x * IMAGE_WIDTH) / SCREEN_WIDTH;
-    if (colLUT[x] >= IMAGE_WIDTH) {
-      colLUT[x] = IMAGE_WIDTH - 1;
-    }
-  }
 }
 
 static void updateFPS() {
@@ -204,7 +215,6 @@ void setup() {
 
   display.begin();
   display.fillScreen(0x0000);
-  initializeLUTs();
   initializeColorLUT();
 
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -379,19 +389,13 @@ void loop() {
     } else if (index > 255) {
       index = 255;
     }
-    sensorColorBuffer[i] = colorMapFromIndex(static_cast<uint8_t>(index));
+    indexBuffer[i] = static_cast<uint8_t>(index);
   }
 
-  display.startWrite();
-  display.setAddrWindow(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
-  for (uint16_t y = 0; y < SCREEN_HEIGHT; ++y) {
-    uint16_t srcRow = rowLUT[y];
-    for (uint16_t x = 0; x < SCREEN_WIDTH; ++x) {
-      lineBuffer[x] = sensorColorBuffer[srcRow * IMAGE_WIDTH + colLUT[x]];
-    }
-    display.writePixels(lineBuffer, SCREEN_WIDTH);
+  for (int y = 0; y < IMAGE_HEIGHT; ++y) {
+    buildLineFromRow(&indexBuffer[y * IMAGE_WIDTH]);
+    pushRowBlock(y);
   }
-  display.endWrite();
 
   updateFPS();
   drawOverlay();
