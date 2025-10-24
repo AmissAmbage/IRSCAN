@@ -201,7 +201,10 @@ static String describeMlxError(int status) {
 }
 
 static bool acquireFrame(float *buffer) {
-  constexpr uint8_t kMaxAttempts = 5;
+  constexpr uint8_t kMaxAttempts = 12;
+  constexpr uint16_t kDataNotReadyDelayMs = 6;  // back off a little so conversions can complete
+  const unsigned long startWait = millis();
+
   for (uint8_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
     int status = mlx.getFrame(buffer);
     if (status == 0) {
@@ -212,8 +215,9 @@ static bool acquireFrame(float *buffer) {
       haveValidFrame = true;
       return true;
     }
+
     if (status == MLX_STATUS_DATA_NOT_READY) {
-      delay(1);
+      delay(kDataNotReadyDelayMs);
       continue;
     }
 
@@ -225,16 +229,23 @@ static bool acquireFrame(float *buffer) {
     return false;
   }
 
-  // All attempts hit "data not ready"; let the caller try again shortly.
-  if (!haveValidFrame && debugMessage != "Waiting") {
-    debugMessage = "Waiting";
+  if (!haveValidFrame) {
+    if (millis() - startWait > 150 && debugMessage != "Waiting") {
+      debugMessage = "Waiting";
+    }
   }
   return false;
 }
 
 void loop() {
   if (!acquireFrame(frameBuffer)) {
-    delay(1);
+    if (haveValidFrame) {
+      unsigned long sinceLast = millis() - lastFrameMillis;
+      if (sinceLast > 250 && debugMessage != "Waiting") {
+        debugMessage = "Waiting";
+      }
+    }
+    delay(2);
     drawOverlay();
     return;
   }
