@@ -23,40 +23,63 @@ constexpr uint16_t SCREEN_HEIGHT = 240;
 constexpr uint16_t IMAGE_WIDTH   = 32;
 constexpr uint16_t IMAGE_HEIGHT  = 24;
 
-struct I2CProfile {
+struct FrequencyProfile {
   uint32_t frequencyHz;
-  mlx90640_refreshrate refreshRate;
   const char *label;
 };
 
-constexpr I2CProfile kI2CProfiles[] = {
-    {1000000, MLX90640_32_HZ, "32Hz@1.0M"},
-    {800000, MLX90640_32_HZ, "32Hz@0.8M"},
-    {400000, MLX90640_16_HZ, "16Hz@0.4M"},
-    {200000, MLX90640_8_HZ,  "8Hz@0.2M"},
+struct RefreshProfile {
+  mlx90640_refreshrate refreshRate;
+  const char *label;
+  float nominalHz;
 };
 
-constexpr size_t kProfileCount = sizeof(kI2CProfiles) / sizeof(kI2CProfiles[0]);
+constexpr FrequencyProfile kFrequencies[] = {
+    {200000,  "0.2MHz"},
+    {400000,  "0.4MHz"},
+    {600000,  "0.6MHz"},
+    {800000,  "0.8MHz"},
+    {1000000, "1.0MHz"},
+};
 
-uint8_t currentProfileIndex = 0;
-uint8_t consecutiveI2CErrors = 0;
-uint16_t consecutiveGoodFrames = 0;
-unsigned long lastProfileChangeMillis = 0;
-uint16_t consecutiveDataNotReadyFailures = 0;
+constexpr RefreshProfile kRefreshRates[] = {
+    {MLX90640_0_5_HZ,  "0.5Hz", 0.5f},
+    {MLX90640_1_HZ,    "1Hz",   1.0f},
+    {MLX90640_2_HZ,    "2Hz",   2.0f},
+    {MLX90640_4_HZ,    "4Hz",   4.0f},
+    {MLX90640_8_HZ,    "8Hz",   8.0f},
+    {MLX90640_16_HZ,   "16Hz",  16.0f},
+    {MLX90640_32_HZ,   "32Hz",  32.0f},
+#ifdef MLX90640_64_HZ
+    {MLX90640_64_HZ,   "64Hz",  64.0f},
+#endif
+};
+
+constexpr size_t kFrequencyCount = sizeof(kFrequencies) / sizeof(kFrequencies[0]);
+constexpr size_t kRefreshCount = sizeof(kRefreshRates) / sizeof(kRefreshRates[0]);
+
+size_t currentFrequencyIndex = 0;
+size_t currentRefreshIndex = 0;
+bool combinationActive = false;
+bool benchmarkComplete = false;
+bool topResultsShown = false;
 
 Adafruit_GC9A01A display = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 Adafruit_MLX90640 mlx;
 
 float frameBuffer[IMAGE_WIDTH * IMAGE_HEIGHT];
 String debugMessage = "Boot";
-bool haveValidFrame = false;
+bool showDebugMessage = true;
+
+unsigned long combinationStartMillis = 0;
+uint32_t combinationStartMicros = 0;
+uint32_t combinationFrameCount = 0;
 
 unsigned long lastFrameMillis = 0;
 float currentFPS = 0.0f;
 
 bool overlayDirty = true;
 unsigned long lastOverlayDraw = 0;
-constexpr bool kShowDebugMessage = false;
 
 bool overlayEnabled = true;
 bool overlayCleared = false;
@@ -64,6 +87,14 @@ bool overlayCleared = false;
 uint32_t lastFrameDurationMicros = 0;
 uint32_t frameDurationAccumMicros = 0;
 uint16_t frameDurationSamples = 0;
+
+struct BenchmarkResult {
+  float fps = 0.0f;
+  uint32_t frames = 0;
+  bool completed = false;
+};
+
+BenchmarkResult benchmarkResults[kRefreshCount][kFrequencyCount];
 
 template <typename Sensor>
 bool setRefreshRateCompatImpl(Sensor &sensor, mlx90640_refreshrate rate, std::false_type) {
@@ -136,7 +167,7 @@ static void drawOverlay() {
   lastRectW = rectW;
   lastRectH = rectH;
 
-  if (kShowDebugMessage) {
+  if (showDebugMessage && debugMessage.length() > 0) {
     display.setTextSize(1);
     display.getTextBounds(debugMessage.c_str(), 0, 0, &x, &y, &w, &h);
     int16_t dbgX = (SCREEN_WIDTH - w) / 2;
@@ -186,41 +217,34 @@ static void updateFPS() {
   }
 }
 
-static void setStreamingMessage() {
-  debugMessage = String("Stream ") + kI2CProfiles[currentProfileIndex].label;
-}
-
-static void applyI2CProfile(uint8_t index, bool announceChange = true) {
-  if (index >= kProfileCount) {
-    index = kProfileCount - 1;
+static bool applyBenchmarkConfig(size_t refreshIndex, size_t frequencyIndex) {
+  if (refreshIndex >= kRefreshCount || frequencyIndex >= kFrequencyCount) {
+    return false;
   }
-  currentProfileIndex = index;
-  const I2CProfile &profile = kI2CProfiles[currentProfileIndex];
 
-  Wire.setClock(profile.frequencyHz);
-  if (!setRefreshRateCompat(mlx, profile.refreshRate)) {
-    Serial.println("Failed to update MLX refresh rate");
-  }
-  lastProfileChangeMillis = millis();
-  consecutiveI2CErrors = 0;
-  consecutiveGoodFrames = 0;
+  const RefreshProfile &refresh = kRefreshRates[refreshIndex];
+  const FrequencyProfile &freq = kFrequencies[frequencyIndex];
 
-  if (announceChange) {
-    Serial.print("MLX profile -> ");
-    Serial.println(profile.label);
-    if (haveValidFrame) {
-      setStreamingMessage();
-    }
+  Wire.setClock(freq.frequencyHz);
+  if (!setRefreshRateCompat(mlx, refresh.refreshRate)) {
+    Serial.println("Failed to set MLX90640 refresh rate");
+    return false;
   }
+
+  char label[48];
+  snprintf(label, sizeof(label), "%s @ %s", refresh.label, freq.label);
+  debugMessage = label;
+  overlayDirty = true;
+  return true;
 }
 
 static bool initializeSensor() {
-  for (uint8_t idx = 0; idx < kProfileCount; ++idx) {
-    const I2CProfile &profile = kI2CProfiles[idx];
-    Wire.setClock(profile.frequencyHz);
+  for (size_t freqIdx = 0; freqIdx < kFrequencyCount; ++freqIdx) {
+    const FrequencyProfile &freq = kFrequencies[freqIdx];
+    Wire.setClock(freq.frequencyHz);
 
     Serial.print("MLX init try ");
-    Serial.println(profile.label);
+    Serial.println(freq.label);
 
     if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
       Serial.println("  -> not found");
@@ -230,14 +254,171 @@ static bool initializeSensor() {
 
     mlx.setMode(MLX90640_INTERLEAVED);
     mlx.setResolution(MLX90640_ADC_18BIT);
-    applyI2CProfile(idx, false);
-
+    currentRefreshIndex = 0;
+    currentFrequencyIndex = 0;
+    if (!applyBenchmarkConfig(currentRefreshIndex, currentFrequencyIndex)) {
+      Serial.println("Failed to apply initial benchmark config");
+      return false;
+    }
     Serial.print("MLX init -> ");
-    Serial.println(kI2CProfiles[currentProfileIndex].label);
+    Serial.print(kRefreshRates[currentRefreshIndex].label);
+    Serial.print(" @ ");
+    Serial.println(kFrequencies[currentFrequencyIndex].label);
     return true;
   }
 
   return false;
+}
+
+static String makeCombinationLabel(size_t refreshIndex, size_t frequencyIndex) {
+  String label;
+  if (refreshIndex < kRefreshCount && frequencyIndex < kFrequencyCount) {
+    label.reserve(32);
+    label += kRefreshRates[refreshIndex].label;
+    label += " @ ";
+    label += kFrequencies[frequencyIndex].label;
+  } else {
+    label = benchmarkComplete ? String("complete") : String("pending");
+  }
+  return label;
+}
+
+static bool startCombinationWindow() {
+  while (currentRefreshIndex < kRefreshCount) {
+    if (applyBenchmarkConfig(currentRefreshIndex, currentFrequencyIndex)) {
+      combinationStartMillis = millis();
+      combinationStartMicros = micros();
+      combinationFrameCount = 0;
+      frameDurationAccumMicros = 0;
+      frameDurationSamples = 0;
+      currentFPS = 0.0f;
+      debugMessage = makeCombinationLabel(currentRefreshIndex, currentFrequencyIndex);
+      overlayDirty = true;
+      combinationActive = true;
+
+      Serial.print("Benchmarking ");
+      Serial.println(debugMessage);
+      return true;
+    }
+
+    Serial.print("Skipping config ");
+    Serial.println(makeCombinationLabel(currentRefreshIndex, currentFrequencyIndex));
+    storeCombinationResult(0.0f, 0);
+    combinationActive = false;
+
+    if (!advanceCombination()) {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+static void storeCombinationResult(float fps, uint32_t frames) {
+  if (currentRefreshIndex < kRefreshCount && currentFrequencyIndex < kFrequencyCount) {
+    BenchmarkResult &result = benchmarkResults[currentRefreshIndex][currentFrequencyIndex];
+    result.fps = fps;
+    result.frames = frames;
+    result.completed = true;
+  }
+}
+
+static bool advanceCombination() {
+  if (++currentFrequencyIndex >= kFrequencyCount) {
+    currentFrequencyIndex = 0;
+    ++currentRefreshIndex;
+  }
+
+  if (currentRefreshIndex >= kRefreshCount) {
+    benchmarkComplete = true;
+    return false;
+  }
+
+  return true;
+}
+
+static void showTopCombinations() {
+  if (topResultsShown) {
+    return;
+  }
+  topResultsShown = true;
+
+  struct RankedResult {
+    float fps;
+    size_t refreshIdx;
+    size_t freqIdx;
+  } top[3] = {};
+
+  for (size_t r = 0; r < kRefreshCount; ++r) {
+    for (size_t f = 0; f < kFrequencyCount; ++f) {
+      const BenchmarkResult &res = benchmarkResults[r][f];
+      if (!res.completed || res.frames == 0) {
+        continue;
+      }
+      for (size_t slot = 0; slot < 3; ++slot) {
+        if (res.fps > top[slot].fps) {
+          for (size_t shift = 2; shift > slot; --shift) {
+            top[shift] = top[shift - 1];
+          }
+          top[slot].fps = res.fps;
+          top[slot].refreshIdx = r;
+          top[slot].freqIdx = f;
+          break;
+        }
+      }
+    }
+  }
+
+  display.fillScreen(0x0000);
+  display.setTextColor(0xFFFF, 0x0000);
+  display.setTextSize(2);
+  display.setCursor(20, 20);
+  display.print("Top 3 configs");
+
+  display.setTextSize(2);
+  int16_t y = 60;
+  bool anyPrinted = false;
+  for (size_t i = 0; i < 3; ++i) {
+    if (top[i].fps <= 0.0f) {
+      continue;
+    }
+    String label = makeCombinationLabel(top[i].refreshIdx, top[i].freqIdx);
+    display.setCursor(10, y);
+    display.print("#");
+    display.print(i + 1);
+    display.print(" ");
+    display.print(label);
+    display.setCursor(10, y + 24);
+    display.print(top[i].fps, 2);
+    display.print(" FPS");
+    y += 48;
+    anyPrinted = true;
+  }
+
+  if (!anyPrinted) {
+    display.setCursor(20, 80);
+    display.print("No valid data");
+  }
+
+  Serial.println("Benchmark complete. Top 3 configurations:");
+  bool anySerial = false;
+  for (size_t i = 0; i < 3; ++i) {
+    if (top[i].fps <= 0.0f) {
+      continue;
+    }
+    String label = makeCombinationLabel(top[i].refreshIdx, top[i].freqIdx);
+    Serial.print("  #");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.print(label);
+    Serial.print(" -> ");
+    Serial.print(top[i].fps, 3);
+    Serial.println(" FPS");
+    anySerial = true;
+  }
+  if (!anySerial) {
+    Serial.println("  (no valid frame data)");
+  }
 }
 
 void setup() {
@@ -262,9 +443,12 @@ void setup() {
     }
   }
 
-  debugMessage = "Init OK";
-  drawOverlay();
-  lastOverlayDraw = millis();
+  if (startCombinationWindow()) {
+    drawOverlay();
+    lastOverlayDraw = millis();
+  } else if (benchmarkComplete && !topResultsShown) {
+    showTopCombinations();
+  }
 }
 
 #ifdef MLX90640_DATA_NOT_READY
@@ -307,9 +491,8 @@ static String describeMlxError(int status) {
 }
 
 static bool acquireFrame(float *buffer) {
-  constexpr uint8_t kMaxAttempts = 12;
-  constexpr uint16_t kDataNotReadyDelayMs = 6;  // back off a little so conversions can complete
-  const unsigned long startWait = millis();
+  constexpr uint8_t kMaxAttempts = 10;
+  constexpr uint16_t kDataNotReadyDelayMs = 5;
   const uint32_t startMicros = micros();
   bool sawDataNotReady = false;
 
@@ -319,20 +502,7 @@ static bool acquireFrame(float *buffer) {
       lastFrameDurationMicros = micros() - startMicros;
       frameDurationAccumMicros += lastFrameDurationMicros;
       ++frameDurationSamples;
-      consecutiveI2CErrors = 0;
-      consecutiveDataNotReadyFailures = 0;
-      ++consecutiveGoodFrames;
-
-      if (consecutiveGoodFrames > 180 && currentProfileIndex > 0 &&
-          millis() - lastProfileChangeMillis > 2000) {
-        applyI2CProfile(currentProfileIndex - 1);
-        Serial.println("Attempting faster MLX profile");
-      }
-
-      haveValidFrame = true;
-      if (!debugMessage.startsWith("Stream ")) {
-        setStreamingMessage();
-      }
+      lastFrameMillis = millis();
       return true;
     }
 
@@ -342,43 +512,17 @@ static bool acquireFrame(float *buffer) {
       continue;
     }
 
-    consecutiveGoodFrames = 0;
-    consecutiveDataNotReadyFailures = 0;
-
-    if (status == -1) {
-      ++consecutiveI2CErrors;
-      if (consecutiveI2CErrors >= 3 && currentProfileIndex + 1 < kProfileCount &&
-          millis() - lastProfileChangeMillis > 500) {
-        applyI2CProfile(currentProfileIndex + 1);
-        debugMessage = String("I2C->") + kI2CProfiles[currentProfileIndex].label + " (" + status + ")";
-      } else {
-        debugMessage = String("MLX I2C(") + status + ")";
-      }
-    } else {
-      consecutiveI2CErrors = 0;
-      debugMessage = String("MLX ") + describeMlxError(status) + " (" + status + ")";
-    }
-
+    debugMessage = String("MLX ") + describeMlxError(status) + " (" + status + ")";
+    overlayDirty = true;
     Serial.print("MLX90640 read error: ");
     Serial.println(status);
     delay(5);
     return false;
   }
 
-  consecutiveGoodFrames = 0;
   if (sawDataNotReady) {
-    ++consecutiveDataNotReadyFailures;
-    if (consecutiveDataNotReadyFailures >= 6 && currentProfileIndex + 1 < kProfileCount &&
-        millis() - lastProfileChangeMillis > 500) {
-      applyI2CProfile(currentProfileIndex + 1);
-      debugMessage = String("Slow->") + kI2CProfiles[currentProfileIndex].label;
-    }
-  }
-
-  if (!haveValidFrame) {
-    if (millis() - startWait > 150 && debugMessage != "Waiting") {
-      debugMessage = "Waiting";
-    }
+    debugMessage = "Waiting";
+    overlayDirty = true;
   }
   return false;
 }
@@ -406,10 +550,12 @@ static void processSerialCommand(const String &line) {
     Serial.println(currentFPS, 3);
     Serial.print("overlay=");
     Serial.println(overlayEnabled ? "ON" : "OFF");
-    Serial.print("profile=");
-    Serial.println(kI2CProfiles[currentProfileIndex].label);
+    Serial.print("config=");
+    Serial.println(makeCombinationLabel(currentRefreshIndex, currentFrequencyIndex));
     Serial.print("frame_us=");
     Serial.println(lastFrameDurationMicros);
+    Serial.print("benchmark=");
+    Serial.println(benchmarkComplete ? "DONE" : "RUNNING");
   }
 }
 
@@ -437,30 +583,63 @@ static void handleSerialCommands() {
 
 void loop() {
   handleSerialCommands();
+  if (benchmarkComplete) {
+    if (!topResultsShown) {
+      showTopCombinations();
+    }
+    return;
+  }
+
+  if (!combinationActive) {
+    if (!startCombinationWindow()) {
+      if (benchmarkComplete && !topResultsShown) {
+        showTopCombinations();
+      }
+      return;
+    }
+  }
+
   bool frameReady = acquireFrame(frameBuffer);
   unsigned long now = millis();
 
   if (frameReady) {
+    debugMessage = makeCombinationLabel(currentRefreshIndex, currentFrequencyIndex);
+    overlayDirty = true;
+    ++combinationFrameCount;
     updateFPS();
-  } else {
-    if (haveValidFrame) {
-      unsigned long sinceLast = now - lastFrameMillis;
-      if (sinceLast > 500 && currentFPS > 0.0f) {
-        currentFPS = 0.0f;
-        overlayDirty = true;
-      }
-      if (sinceLast > 250 && debugMessage != "Waiting") {
-        debugMessage = "Waiting";
-      }
-    } else if (currentFPS != 0.0f) {
-      currentFPS = 0.0f;
-      overlayDirty = true;
-    }
-
-    delay(2);
   }
 
-  if (overlayDirty && (now - lastOverlayDraw >= 100)) {
+  unsigned long elapsedMillis = now - combinationStartMillis;
+  if (combinationActive && elapsedMillis >= 5000UL) {
+    uint32_t elapsedMicros = micros() - combinationStartMicros;
+    float fps = 0.0f;
+    if (combinationFrameCount > 0 && elapsedMicros > 0) {
+      fps = combinationFrameCount * 1000000.0f / static_cast<float>(elapsedMicros);
+    }
+
+    storeCombinationResult(fps, combinationFrameCount);
+
+    Serial.print("Completed ");
+    Serial.print(makeCombinationLabel(currentRefreshIndex, currentFrequencyIndex));
+    Serial.print(": ");
+    Serial.print(fps, 3);
+    Serial.println(" FPS");
+
+    combinationActive = false;
+
+    if (advanceCombination()) {
+      if (!startCombinationWindow()) {
+        if (benchmarkComplete && !topResultsShown) {
+          showTopCombinations();
+        }
+        return;
+      }
+    } else {
+      showTopCombinations();
+    }
+  }
+
+  if (!benchmarkComplete && overlayDirty && (now - lastOverlayDraw >= 100)) {
     drawOverlay();
     lastOverlayDraw = now;
   }
