@@ -115,7 +115,11 @@ void setup() {
   display.fillScreen(0x0000);
 
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(1000000);  // 1 MHz for faster updates if supported
+  // The MLX90640 is specified for up to 1 MHz fast-mode plus, but many
+  // breakouts (and long wiring runs) struggle to remain reliable at that
+  // speed. 400 kHz has proven to be a safer setting in practice and avoids
+  // spurious I2C read errors that manifest as status -1 from getFrame().
+  Wire.setClock(400000);
 
   if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
     debugMessage = "MLX init fail";
@@ -134,10 +138,27 @@ void setup() {
   drawOverlay();
 }
 
+static String describeMlxError(int status) {
+  switch (status) {
+    case MLX90640_NO_ERROR:
+      return "OK";
+    case MLX90640_I2C_READ_ERROR:
+      return "I2C read";
+    case MLX90640_I2C_WRITE_ERROR:
+      return "I2C write";
+    case MLX90640_INVALID_TEMPERATURE:
+      return "Temp range";
+    case MLX90640_INVALID_PARAMETR:
+      return "Bad param";
+    default:
+      return String("Err ") + status;
+  }
+}
+
 void loop() {
   int status = mlx.getFrame(frameBuffer);
   if (status != 0) {
-    debugMessage = String("MLX err ") + status;
+    debugMessage = String("MLX ") + describeMlxError(status);
     Serial.print("MLX90640 read error: ");
     Serial.println(status);
     delay(10);
@@ -159,6 +180,7 @@ void loop() {
   constexpr uint16_t imageWidth = 32;
   constexpr uint16_t imageHeight = 24;
 
+  display.startWrite();
   for (uint16_t y = 0; y < imageHeight; ++y) {
     uint16_t drawY0 = (y * SCREEN_HEIGHT) / imageHeight;
     uint16_t drawY1 = ((y + 1) * SCREEN_HEIGHT) / imageHeight;
@@ -169,9 +191,10 @@ void loop() {
       uint16_t drawX0 = (x * SCREEN_WIDTH) / imageWidth;
       uint16_t drawX1 = ((x + 1) * SCREEN_WIDTH) / imageWidth;
       uint16_t rectWidth = std::max<uint16_t>(1, drawX1 - drawX0);
-      display.fillRect(drawX0, drawY0, rectWidth, rectHeight, color);
+      display.writeFillRectPreclipped(drawX0, drawY0, rectWidth, rectHeight, color);
     }
   }
+  display.endWrite();
 
   updateFPS();
   drawOverlay();
