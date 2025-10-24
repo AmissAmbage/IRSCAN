@@ -140,16 +140,30 @@ void setup() {
 
 static String describeMlxError(int status) {
   switch (status) {
+#ifdef MLX90640_NO_ERROR
     case MLX90640_NO_ERROR:
       return "OK";
+#endif
+#ifdef MLX90640_I2C_READ_ERROR
     case MLX90640_I2C_READ_ERROR:
       return "I2C read";
+#endif
+#ifdef MLX90640_I2C_WRITE_ERROR
     case MLX90640_I2C_WRITE_ERROR:
       return "I2C write";
+#endif
+#ifdef MLX90640_INVALID_TEMPERATURE
     case MLX90640_INVALID_TEMPERATURE:
       return "Temp range";
+#endif
+#ifdef MLX90640_INVALID_PARAMETR
     case MLX90640_INVALID_PARAMETR:
       return "Bad param";
+#endif
+    case 0:
+      return "OK";
+    case -1:
+      return "I2C fault";
     default:
       return String("Err ") + status;
   }
