@@ -34,41 +34,49 @@ float currentFPS = 0.0f;
 uint8_t rowLUT[SCREEN_HEIGHT];
 uint8_t colLUT[SCREEN_WIDTH];
 uint16_t lineBuffer[SCREEN_WIDTH];
+uint16_t colorFrame[IMAGE_WIDTH * IMAGE_HEIGHT];
+uint16_t thermalPalette[256];
 
-// Simple blue-to-red color map for temperature visualization
-static uint16_t colorMap(float value, float minValue, float maxValue) {
-  value = constrain(value, minValue, maxValue);
-  float ratio = (maxValue - minValue) > 0 ? (value - minValue) / (maxValue - minValue) : 0.0f;
-
-  // Use a simple gradient: blue -> cyan -> green -> yellow -> red
-  float r = 0, g = 0, b = 0;
-  if (ratio <= 0.25f) {
-    // Blue to Cyan
-    float local = ratio / 0.25f;
-    r = 0;
-    g = local * 255.0f;
-    b = 255.0f;
-  } else if (ratio <= 0.5f) {
-    // Cyan to Green
-    float local = (ratio - 0.25f) / 0.25f;
-    r = 0;
-    g = 255.0f;
-    b = (1.0f - local) * 255.0f;
-  } else if (ratio <= 0.75f) {
-    // Green to Yellow
-    float local = (ratio - 0.5f) / 0.25f;
-    r = local * 255.0f;
-    g = 255.0f;
-    b = 0;
-  } else {
-    // Yellow to Red
-    float local = (ratio - 0.75f) / 0.25f;
-    r = 255.0f;
-    g = (1.0f - local) * 255.0f;
-    b = 0;
+static void initializePalette() {
+  for (uint16_t i = 0; i < 256; ++i) {
+    float ratio = i / 255.0f;
+    float r = 0, g = 0, b = 0;
+    if (ratio <= 0.25f) {
+      float local = ratio / 0.25f;
+      r = 0;
+      g = local * 255.0f;
+      b = 255.0f;
+    } else if (ratio <= 0.5f) {
+      float local = (ratio - 0.25f) / 0.25f;
+      r = 0;
+      g = 255.0f;
+      b = (1.0f - local) * 255.0f;
+    } else if (ratio <= 0.75f) {
+      float local = (ratio - 0.5f) / 0.25f;
+      r = local * 255.0f;
+      g = 255.0f;
+      b = 0;
+    } else {
+      float local = (ratio - 0.75f) / 0.25f;
+      r = 255.0f;
+      g = (1.0f - local) * 255.0f;
+      b = 0;
+    }
+    thermalPalette[i] = display.color565(static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b));
   }
+}
 
-  return display.color565(static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b));
+static inline uint16_t colorFromValue(float value, float minValue, float invRange) {
+  int32_t idx = 0;
+  if (invRange > 0.0f) {
+    idx = static_cast<int32_t>((value - minValue) * invRange + 0.5f);
+  }
+  if (idx < 0) {
+    idx = 0;
+  } else if (idx > 255) {
+    idx = 255;
+  }
+  return thermalPalette[idx];
 }
 
 static void drawOverlay() {
@@ -134,6 +142,7 @@ void setup() {
   display.begin();
   display.fillScreen(0x0000);
   initializeLUTs();
+  initializePalette();
 
   Wire.begin(I2C_SDA, I2C_SCL);
   // The MLX90640 is specified for up to 1 MHz fast-mode plus, but many
@@ -181,10 +190,16 @@ static String describeMlxError(int status) {
     case MLX90640_INVALID_PARAMETR:
       return "Bad param";
 #endif
+#ifdef MLX90640_DATA_NOT_READY
+    case MLX90640_DATA_NOT_READY:
+      return "Data wait";
+#endif
     case 0:
       return "OK";
     case -1:
       return "I2C fault";
+    case -8:
+      return "Data wait";
     default:
       return String("Err ") + status;
   }
@@ -194,16 +209,21 @@ void loop() {
   int status = mlx.getFrame(frameBuffer);
   if (status != 0) {
     debugMessage = String("MLX ") + describeMlxError(status);
-    Serial.print("MLX90640 read error: ");
-    Serial.println(status);
-    delay(10);
+    if (status != -8) {
+      Serial.print("MLX90640 read error: ");
+      Serial.println(status);
+      delay(10);
+    } else {
+      delay(2);
+    }
     drawOverlay();
     return;
   }
 
   float minTemp = frameBuffer[0];
   float maxTemp = frameBuffer[0];
-  for (float value : frameBuffer) {
+  for (size_t i = 1; i < IMAGE_WIDTH * IMAGE_HEIGHT; ++i) {
+    float value = frameBuffer[i];
     if (value < minTemp) {
       minTemp = value;
     }
@@ -212,19 +232,28 @@ void loop() {
     }
   }
 
+  float invRange = 0.0f;
+  if (maxTemp - minTemp > 0.01f) {
+    invRange = 255.0f / (maxTemp - minTemp);
+  }
+
+  for (size_t i = 0; i < IMAGE_WIDTH * IMAGE_HEIGHT; ++i) {
+    colorFrame[i] = colorFromValue(frameBuffer[i], minTemp, invRange);
+  }
+
   display.startWrite();
+  display.setAddrWindow(0, 0, SCREEN_WIDTH - 1, SCREEN_HEIGHT - 1);
   for (uint16_t y = 0; y < SCREEN_HEIGHT; ++y) {
     uint16_t srcRow = rowLUT[y];
-    const float *rowPtr = &frameBuffer[srcRow * IMAGE_WIDTH];
+    const uint16_t *rowPtr = &colorFrame[srcRow * IMAGE_WIDTH];
     for (uint16_t x = 0; x < SCREEN_WIDTH; ++x) {
-      float value = rowPtr[colLUT[x]];
-      lineBuffer[x] = colorMap(value, minTemp, maxTemp);
+      lineBuffer[x] = rowPtr[colLUT[x]];
     }
-    display.setAddrWindow(0, y, SCREEN_WIDTH - 1, y);
     display.writePixels(lineBuffer, SCREEN_WIDTH, false);
   }
   display.endWrite();
 
+  debugMessage = "MLX OK";
   updateFPS();
   drawOverlay();
 }
