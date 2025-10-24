@@ -49,20 +49,14 @@ Adafruit_MLX90640 mlx;
 
 float frameBuffer[IMAGE_WIDTH * IMAGE_HEIGHT];
 String debugMessage = "Boot";
-bool sensorHealthy = true;
 bool haveValidFrame = false;
 
 unsigned long lastFrameMillis = 0;
 float currentFPS = 0.0f;
 
-static const int DST_W = 224;
-static const int SCALE_X = 7;
-static const int SCALE_Y = 10;
-static const int X_OFFSET = (SCREEN_WIDTH - DST_W) / 2;
-
-uint16_t lineBuffer[DST_W];
-uint8_t indexBuffer[IMAGE_WIDTH * IMAGE_HEIGHT];
-uint16_t colorLUT[256];
+bool overlayDirty = true;
+unsigned long lastOverlayDraw = 0;
+constexpr bool kShowDebugMessage = false;
 
 template <typename Sensor>
 bool setRefreshRateCompatImpl(Sensor &sensor, mlx90640_refreshrate rate, std::false_type) {
@@ -81,99 +75,80 @@ bool setRefreshRateCompat(Sensor &sensor, mlx90640_refreshrate rate) {
   return setRefreshRateCompatImpl(sensor, rate, typename std::is_void<ReturnType>::type{});
 }
 
-// Simple blue-to-red color map for temperature visualization
-static uint16_t colorMapFromIndex(uint8_t index) {
-  return colorLUT[index];
-}
-
-static void initializeColorLUT() {
-  for (int i = 0; i < 256; ++i) {
-    float ratio = i / 255.0f;
-
-    float r = 0, g = 0, b = 0;
-    if (ratio <= 0.25f) {
-      float local = ratio / 0.25f;
-      r = 0;
-      g = local * 255.0f;
-      b = 255.0f;
-    } else if (ratio <= 0.5f) {
-      float local = (ratio - 0.25f) / 0.25f;
-      r = 0;
-      g = 255.0f;
-      b = (1.0f - local) * 255.0f;
-    } else if (ratio <= 0.75f) {
-      float local = (ratio - 0.5f) / 0.25f;
-      r = local * 255.0f;
-      g = 255.0f;
-      b = 0;
-    } else {
-      float local = (ratio - 0.75f) / 0.25f;
-      r = 255.0f;
-      g = (1.0f - local) * 255.0f;
-      b = 0;
-    }
-
-    colorLUT[i] = display.color565(static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b));
-  }
-}
-
-static inline void buildLineFromRow(const uint8_t *row) {
-  for (int x = 0; x < IMAGE_WIDTH; ++x) {
-    uint16_t color = colorMapFromIndex(row[x]);
-    int dst = x * SCALE_X;
-    lineBuffer[dst + 0] = color;
-    lineBuffer[dst + 1] = color;
-    lineBuffer[dst + 2] = color;
-    lineBuffer[dst + 3] = color;
-    lineBuffer[dst + 4] = color;
-    lineBuffer[dst + 5] = color;
-    lineBuffer[dst + 6] = color;
-  }
-}
-
-static inline void pushRowBlock(int sensorRow) {
-  display.startWrite();
-  display.setAddrWindow(X_OFFSET, sensorRow * SCALE_Y, DST_W, SCALE_Y);
-  for (int i = 0; i < SCALE_Y; ++i) {
-    display.writePixels(lineBuffer, DST_W, true);
-  }
-  display.endWrite();
-}
-
 static void drawOverlay() {
-  char fpsBuffer[16];
-  snprintf(fpsBuffer, sizeof(fpsBuffer), "FPS: %.1f", currentFPS);
+  overlayDirty = false;
 
-  display.setTextSize(1);
+  static int16_t lastRectX = -1;
+  static int16_t lastRectY = -1;
+  static uint16_t lastRectW = 0;
+  static uint16_t lastRectH = 0;
+
+  char fpsBuffer[24];
+  snprintf(fpsBuffer, sizeof(fpsBuffer), "FPS: %.2f", currentFPS);
+
+  display.setTextSize(2);
+  display.setTextWrap(false);
   display.setTextColor(0xFFFF, 0x0000);
+
+  if (lastRectW > 0) {
+    display.fillRect(lastRectX, lastRectY, lastRectW, lastRectH, 0x0000);
+  }
 
   int16_t x, y;
   uint16_t w, h;
-
   display.getTextBounds(fpsBuffer, 0, 0, &x, &y, &w, &h);
   int16_t fpsX = (SCREEN_WIDTH - w) / 2;
-  int16_t fpsY = (SCREEN_HEIGHT / 2) - (h / 2) - 6;
-  display.fillRect(fpsX - 2, fpsY - 2, w + 4, h + 4, 0x0000);
+  int16_t fpsY = (SCREEN_HEIGHT - h) / 2;
+
+  int16_t rectX = fpsX - 6;
+  int16_t rectY = fpsY - 6;
+  uint16_t rectW = w + 12;
+  uint16_t rectH = h + 12;
+
+  display.fillRect(rectX, rectY, rectW, rectH, 0x0000);
   display.setCursor(fpsX, fpsY);
   display.print(fpsBuffer);
 
-  display.getTextBounds(debugMessage.c_str(), 0, 0, &x, &y, &w, &h);
-  int16_t dbgX = (SCREEN_WIDTH - w) / 2;
-  int16_t dbgY = fpsY + h + 12;
-  display.fillRect(dbgX - 2, dbgY - 2, w + 4, h + 4, 0x0000);
-  display.setCursor(dbgX, dbgY);
-  display.print(debugMessage);
+  lastRectX = rectX;
+  lastRectY = rectY;
+  lastRectW = rectW;
+  lastRectH = rectH;
+
+  if (kShowDebugMessage) {
+    display.setTextSize(1);
+    display.getTextBounds(debugMessage.c_str(), 0, 0, &x, &y, &w, &h);
+    int16_t dbgX = (SCREEN_WIDTH - w) / 2;
+    int16_t dbgY = fpsY + rectH / 2 + 10;
+    display.fillRect(dbgX - 2, dbgY - 2, w + 4, h + 4, 0x0000);
+    display.setCursor(dbgX, dbgY);
+    display.print(debugMessage);
+  }
 }
 
 static void updateFPS() {
+  static uint32_t frameCount = 0;
+  static unsigned long windowStart = 0;
+
   unsigned long now = millis();
-  if (lastFrameMillis != 0) {
-    float delta = (now - lastFrameMillis) / 1000.0f;
-    if (delta > 0) {
-      currentFPS = 0.8f * currentFPS + 0.2f * (1.0f / delta);  // simple smoothing
-    }
+  if (windowStart == 0) {
+    windowStart = now;
   }
+
+  ++frameCount;
   lastFrameMillis = now;
+
+  unsigned long elapsed = now - windowStart;
+  if (elapsed >= 500) {
+    if (elapsed > 2000) {
+      frameCount = 1;
+      windowStart = now;
+      return;
+    }
+    currentFPS = (frameCount * 1000.0f) / static_cast<float>(elapsed);
+    frameCount = 0;
+    windowStart = now;
+    overlayDirty = true;
+  }
 }
 
 static void setStreamingMessage() {
@@ -238,21 +213,23 @@ void setup() {
 
   display.begin();
   display.fillScreen(0x0000);
-  initializeColorLUT();
 
   Wire.begin(I2C_SDA, I2C_SCL);
 
   if (!initializeSensor()) {
     debugMessage = "MLX init fail";
     Serial.println("Failed to find MLX90640 sensor at any profile.");
+    currentFPS = 0.0f;
     while (true) {
       drawOverlay();
+      lastOverlayDraw = millis();
       delay(120);
     }
   }
 
   debugMessage = "Init OK";
   drawOverlay();
+  lastOverlayDraw = millis();
 }
 
 #ifdef MLX90640_DATA_NOT_READY
@@ -303,7 +280,6 @@ static bool acquireFrame(float *buffer) {
   for (uint8_t attempt = 0; attempt < kMaxAttempts; ++attempt) {
     int status = mlx.getFrame(buffer);
     if (status == 0) {
-      sensorHealthy = true;
       consecutiveI2CErrors = 0;
       consecutiveDataNotReadyFailures = 0;
       ++consecutiveGoodFrames;
@@ -327,7 +303,6 @@ static bool acquireFrame(float *buffer) {
       continue;
     }
 
-    sensorHealthy = false;
     consecutiveGoodFrames = 0;
     consecutiveDataNotReadyFailures = 0;
 
@@ -370,49 +345,31 @@ static bool acquireFrame(float *buffer) {
 }
 
 void loop() {
-  if (!acquireFrame(frameBuffer)) {
+  bool frameReady = acquireFrame(frameBuffer);
+  unsigned long now = millis();
+
+  if (frameReady) {
+    updateFPS();
+  } else {
     if (haveValidFrame) {
-      unsigned long sinceLast = millis() - lastFrameMillis;
+      unsigned long sinceLast = now - lastFrameMillis;
+      if (sinceLast > 500 && currentFPS > 0.0f) {
+        currentFPS = 0.0f;
+        overlayDirty = true;
+      }
       if (sinceLast > 250 && debugMessage != "Waiting") {
         debugMessage = "Waiting";
       }
+    } else if (currentFPS != 0.0f) {
+      currentFPS = 0.0f;
+      overlayDirty = true;
     }
+
     delay(2);
+  }
+
+  if (overlayDirty && (now - lastOverlayDraw >= 100)) {
     drawOverlay();
-    return;
+    lastOverlayDraw = now;
   }
-
-  float minTemp = frameBuffer[0];
-  float maxTemp = frameBuffer[0];
-  for (float value : frameBuffer) {
-    if (value < minTemp) {
-      minTemp = value;
-    }
-    if (value > maxTemp) {
-      maxTemp = value;
-    }
-  }
-
-  const float span = maxTemp - minTemp;
-  const float scale = span > 0.0001f ? (255.0f / span) : 0.0f;
-
-  for (size_t i = 0; i < IMAGE_WIDTH * IMAGE_HEIGHT; ++i) {
-    float value = frameBuffer[i];
-    float scaled = (value - minTemp) * scale;
-    int index = static_cast<int>(scaled + 0.5f);
-    if (index < 0) {
-      index = 0;
-    } else if (index > 255) {
-      index = 255;
-    }
-    indexBuffer[i] = static_cast<uint8_t>(index);
-  }
-
-  for (int y = 0; y < IMAGE_HEIGHT; ++y) {
-    buildLineFromRow(&indexBuffer[y * IMAGE_WIDTH]);
-    pushRowBlock(y);
-  }
-
-  updateFPS();
-  drawOverlay();
 }
